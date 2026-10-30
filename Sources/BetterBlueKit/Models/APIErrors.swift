@@ -58,6 +58,19 @@ public struct APIError: LocalizedError, Codable {
     public var errorDescription: String? { message }
     public var failureReason: String? { errorType.displayLabel }
 
+    /// Indicates whether this error represents an expired or invalidated session
+    /// that can potentially be recovered by silent re-authentication.
+    public var isSessionExpired: Bool {
+        if errorType == .invalidVehicleSession { return true }
+        if errorType == .invalidCredentials {
+            let lower = message.lowercased()
+            if code == 401 && (lower.contains("session") || lower.contains("expired") || lower.contains("token") || lower.contains("authentication expired")) {
+                return true
+            }
+        }
+        return false
+    }
+
     public init(
         message: String,
         code: Int? = nil,
@@ -131,21 +144,21 @@ public struct APIError: LocalizedError, Codable {
 
     public static func invalidVehicleSession(
         _ message: String = "Invalid vehicle for current session",
-        apiName: String? = nil,
+        apiName: String? = nil
     ) -> APIError {
         logError(message, code: 1005, apiName: apiName, errorType: .invalidVehicleSession)
     }
 
     public static func invalidCredentials(
         _ message: String = "Invalid username or password",
-        apiName: String? = nil,
+        apiName: String? = nil
     ) -> APIError {
         logError(message, code: 401, apiName: apiName, errorType: .invalidCredentials)
     }
 
     public static func serverError(
         _ message: String = "Server temporarily unavailable",
-        apiName: String? = nil,
+        apiName: String? = nil
     ) -> APIError {
         logError(message, code: 502, apiName: apiName, errorType: .serverError)
     }
@@ -156,35 +169,35 @@ public struct APIError: LocalizedError, Codable {
 
     public static func concurrentRequest(
         _ message: String = "Another request is already in progress. Please wait and try again.",
-        apiName: String? = nil,
+        apiName: String? = nil
     ) -> APIError {
         logError(message, code: 502, apiName: apiName, errorType: .concurrentRequest)
     }
 
     public static func failedRetryLogin(
         _ message: String = "Failed to reauthenticate",
-        apiName: String? = nil,
+        apiName: String? = nil
     ) -> APIError {
         logError(message, code: 502, apiName: apiName, errorType: .failedRetryLogin)
     }
 
     public static func kiaInvalidRequest(
         _ message: String = "Invalid request",
-        apiName: String? = nil,
+        apiName: String? = nil
     ) -> APIError {
         logError(message, code: 502, apiName: apiName, errorType: .kiaInvalidRequest)
     }
 
     public static func featureNotSupported(
         _ message: String = "This vehicle does not support this feature",
-        apiName: String? = nil,
+        apiName: String? = nil
     ) -> APIError {
         logError(message, code: 502, apiName: apiName, errorType: .featureNotSupported)
     }
 
     public static func regionNotSupported(
         _ message: String = "This region is not yet supported",
-        apiName: String? = nil,
+        apiName: String? = nil
     ) -> APIError {
         logError(message, apiName: apiName, errorType: .regionNotSupported)
     }

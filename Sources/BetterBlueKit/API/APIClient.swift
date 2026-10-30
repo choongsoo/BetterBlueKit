@@ -28,6 +28,9 @@ public struct APIClientConfiguration {
     /// Currently used only by `KiaUSAAPIClient`; other implementations
     /// may opt in by capturing their respective rotated tokens.
     public let onRememberMeTokenRotated: (@MainActor @Sendable (String) -> Void)?
+    /// Invoked when the API client refreshes or recovers an auth token
+    /// in the background, allowing callers to persist the latest valid session.
+    public let onAuthTokenRefreshed: (@MainActor @Sendable (AuthToken) -> Void)?
 
     public init(
         region: Region,
@@ -41,7 +44,8 @@ public struct APIClientConfiguration {
         rememberMeToken: String? = nil,
         redactPII: Bool = true,
         deviceId: String? = nil,
-        onRememberMeTokenRotated: (@MainActor @Sendable (String) -> Void)? = nil
+        onRememberMeTokenRotated: (@MainActor @Sendable (String) -> Void)? = nil,
+        onAuthTokenRefreshed: (@MainActor @Sendable (AuthToken) -> Void)? = nil
     ) {
         self.region = region
         self.brand = brand
@@ -55,9 +59,14 @@ public struct APIClientConfiguration {
         self.redactPII = redactPII
         self.deviceId = deviceId
         self.onRememberMeTokenRotated = onRememberMeTokenRotated
+        self.onAuthTokenRefreshed = onAuthTokenRefreshed
     }
 
-    public func with(deviceId: String? = nil, refreshToken: String? = nil) -> Self {
+    public func with(
+        deviceId: String? = nil,
+        refreshToken: String? = nil,
+        rememberMeToken: String? = nil
+    ) -> Self {
         .init(
             region: region,
             brand: brand,
@@ -67,10 +76,11 @@ public struct APIClientConfiguration {
             pin: pin,
             accountId: accountId,
             logSink: logSink,
-            rememberMeToken: rememberMeToken,
+            rememberMeToken: rememberMeToken ?? self.rememberMeToken,
             redactPII: redactPII,
             deviceId: deviceId ?? self.deviceId,
-            onRememberMeTokenRotated: onRememberMeTokenRotated
+            onRememberMeTokenRotated: onRememberMeTokenRotated,
+            onAuthTokenRefreshed: onAuthTokenRefreshed
         )
     }
 }
@@ -204,7 +214,10 @@ extension APIClientProtocol {
     }
 
     public func requestSurroundViewCapture(for vehicle: Vehicle, authToken: AuthToken) async throws {
-        throw APIError(message: "Surround view not supported for this API", apiName: "APIClient")
+        throw APIError.featureNotSupported(
+            "Surround-view capture is not supported for this vehicle or region",
+            apiName: "APIClient"
+        )
     }
 
     public func fetchSurroundViewCaptures(
@@ -214,8 +227,6 @@ extension APIClientProtocol {
         []
     }
 
-    /// Default: nothing more to fetch. Correct for every region that
-    /// returns imagery inline with the listing.
     public func fetchSurroundViewImagery(
         for capture: SurroundViewCapture,
         vehicle _: Vehicle,

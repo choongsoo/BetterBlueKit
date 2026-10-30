@@ -119,32 +119,34 @@ extension KiaUSAAPIClient {
     ///   to `.concurrentRequest`. If one turns up in the wild, map it the
     ///   way `HyundaiUSAAPIClient` maps `HT_533`.
     public func requestSurroundViewCapture(for vehicle: Vehicle, authToken: AuthToken) async throws {
-        let (data, json, _) = try await performJSONRequest(
-            url: "\(apiURL)lbs/svm/req",
-            method: .POST,
-            headers: authorizedHeaders(authToken: authToken, vehicleKey: vehicle.vehicleKey),
-            body: [:],
-            requestType: .requestSurroundView,
-            vin: vehicle.vin
-        )
-
-        try checkForKiaErrors(data: data)
-
-        // `checkForKiaErrors` only throws for the handful of codes it
-        // recognises, and unlike the fetch paths this one has no parse
-        // step afterwards to trip over a missing payload. So assert
-        // SUCCESS rather than the absence of known failures: without
-        // this, any unrecognised refusal — including the 9000 the probe
-        // used as its "no such path" control — returns as though the
-        // vehicle had accepted the request, and the app would sit
-        // polling for a capture that was never taken.
-        if let status = json["status"] as? [String: Any],
-           let errorCode: Int = extractNumber(from: status["errorCode"]),
-           errorCode != 0 {
-            throw APIError.logError(
-                "Kia US 360 View capture refused — \(status)",
-                apiName: apiName
+        try await withSessionRecovery(authToken: authToken) { token in
+            let (data, json, _) = try await performJSONRequest(
+                url: "\(apiURL)lbs/svm/req",
+                method: .POST,
+                headers: authorizedHeaders(authToken: token, vehicleKey: vehicle.vehicleKey),
+                body: [:],
+                requestType: .requestSurroundView,
+                vin: vehicle.vin
             )
+
+            try checkForKiaErrors(data: data)
+
+            // `checkForKiaErrors` only throws for the handful of codes it
+            // recognises, and unlike the fetch paths this one has no parse
+            // step afterwards to trip over a missing payload. So assert
+            // SUCCESS rather than the absence of known failures: without
+            // this, any unrecognised refusal — including the 9000 the probe
+            // used as its "no such path" control — returns as though the
+            // vehicle had accepted the request, and the app would sit
+            // polling for a capture that was never taken.
+            if let status = json["status"] as? [String: Any],
+               let errorCode: Int = extractNumber(from: status["errorCode"]),
+               errorCode != 0 {
+                throw APIError.logError(
+                    "Kia US 360 View capture refused — \(status)",
+                    apiName: apiName
+                )
+            }
         }
     }
 
@@ -164,67 +166,69 @@ extension KiaUSAAPIClient {
         for vehicle: Vehicle,
         authToken: AuthToken
     ) async throws -> [SurroundViewCapture] {
-        // Sort before truncating: nothing documents the order `inquire`
-        // answers in, and taking the "first" ten of an oldest-first list
-        // would silently list the wrong decade of history. The stamps are
-        // fixed-width `yyyyMMddHHmmss`, so a string sort IS a date sort.
-        var entries = try await fetchSurroundViewIndex(for: vehicle, authToken: authToken)
-            .sorted { syncStamp(of: $0) > syncStamp(of: $1) }
+        try await withSessionRecovery(authToken: authToken) { token in
+            // Sort before truncating: nothing documents the order `inquire`
+            // answers in, and taking the "first" ten of an oldest-first list
+            // would silently list the wrong decade of history. The stamps are
+            // fixed-width `yyyyMMddHHmmss`, so a string sort IS a date sort.
+            var entries = try await fetchSurroundViewIndex(for: vehicle, authToken: token)
+                .sorted { syncStamp(of: $0) > syncStamp(of: $1) }
 
-        if entries.count > Self.maxSurroundViewCaptures {
-            BBLogger.debug(
-                .api,
-                "KiaUSA: 360 View returned \(entries.count) captures, listing the newest "
-                    + "\(Self.maxSurroundViewCaptures)"
-            )
-            entries = Array(entries.prefix(Self.maxSurroundViewCaptures))
-        }
-
-        var index: [String: [String: Any]] = [:]
-        var captures: [SurroundViewCapture] = []
-
-        for entry in entries {
-            guard let svmId = entry["svmId"], !(svmId is NSNull) else {
-                BBLogger.warning(.api, "KiaUSA: skipping 360 View entry without an svmId")
-                continue
+            if entries.count > Self.maxSurroundViewCaptures {
+                BBLogger.debug(
+                    .api,
+                    "KiaUSA: 360 View returned \(entries.count) captures, listing the newest "
+                        + "\(Self.maxSurroundViewCaptures)"
+                )
+                entries = Array(entries.prefix(Self.maxSurroundViewCaptures))
             }
 
-            let providerID = "\(svmId)"
-            index[providerID] = entry
+            var index: [String: [String: Any]] = [:]
+            var captures: [SurroundViewCapture] = []
 
-            // A capture never changes once uploaded, so imagery already
-            // fetched this session is reused rather than re-downloaded.
-            captures.append(
-                surroundViewCache[providerID]
-                    ?? SurroundViewCaptureParser.metadata(
-                        from: entry,
-                        vin: vehicle.vin,
-                        shape: Self.surroundViewShape,
-                        providerID: providerID
-                    )
-            )
+            for entry in entries {
+                guard let svmId = entry["svmId"], !(svmId is NSNull) else {
+                    BBLogger.warning(.api, "KiaUSA: skipping 360 View entry without an svmId")
+                    continue
+                }
+
+                let providerID = "\(svmId)"
+                index[providerID] = entry
+
+                // A capture never changes once uploaded, so imagery already
+                // fetched this session is reused rather than re-downloaded.
+                captures.append(
+                    surroundViewCache[providerID]
+                        ?? SurroundViewCaptureParser.metadata(
+                            from: entry,
+                            vin: vehicle.vin,
+                            shape: Self.surroundViewShape,
+                            providerID: providerID
+                        )
+                )
+            }
+
+            surroundViewIndex = index
+            // Replace rather than merge, so a capture the owner deleted stops
+            // being held in memory. This bounds the cache to whatever the
+            // gallery currently lists — Kia retains ten.
+            surroundViewCache = surroundViewCache.filter { index[$0.key] != nil }
+
+            captures.sort { ($0.capturedAt ?? .distantPast) > ($1.capturedAt ?? .distantPast) }
+
+            // Load the newest eagerly. Failures here propagate rather than
+            // yielding a gallery that renders as "no captures yet" — that
+            // distinction is the whole reason the eager version threw.
+            if let newest = captures.first, !newest.isLoaded {
+                captures[0] = try await fetchSurroundViewImagery(
+                    for: newest,
+                    vehicle: vehicle,
+                    authToken: token
+                )
+            }
+
+            return captures
         }
-
-        surroundViewIndex = index
-        // Replace rather than merge, so a capture the owner deleted stops
-        // being held in memory. This bounds the cache to whatever the
-        // gallery currently lists — Kia retains ten.
-        surroundViewCache = surroundViewCache.filter { index[$0.key] != nil }
-
-        captures.sort { ($0.capturedAt ?? .distantPast) > ($1.capturedAt ?? .distantPast) }
-
-        // Load the newest eagerly. Failures here propagate rather than
-        // yielding a gallery that renders as "no captures yet" — that
-        // distinction is the whole reason the eager version threw.
-        if let newest = captures.first, !newest.isLoaded {
-            captures[0] = try await fetchSurroundViewImagery(
-                for: newest,
-                vehicle: vehicle,
-                authToken: authToken
-            )
-        }
-
-        return captures
     }
 
     /// Fills in one capture's imagery, on demand.
@@ -240,43 +244,47 @@ extension KiaUSAAPIClient {
         guard !capture.isLoaded, let providerID = capture.providerID else { return capture }
         if let cached = surroundViewCache[providerID] { return cached }
 
-        // Send the id back with the TYPE the server used — `inquire`
-        // reports a JSON number, and the portal echoes `a.svmId`
-        // untouched. `providerID` is its string form, only ever a
-        // dictionary key; stringifying it on the wire risks a rejection.
-        let indexEntry = surroundViewIndex[providerID]
-        let detail = try await fetchSurroundViewDetail(
-            svmId: indexEntry?["svmId"] ?? providerID,
-            for: vehicle,
-            authToken: authToken
-        )
+        return try await withSessionRecovery(authToken: authToken) { token in
+            if let cached = surroundViewCache[providerID] { return cached }
 
-        // Overlay the detail onto its index entry so the parser reads one
-        // dictionary. `info` wins where the two overlap: it is the
-        // response that carries `imageSize`, and it repeats the location
-        // block anyway. Starting from the `inquire` entry rather than
-        // replacing it keeps anything the index reported and the detail
-        // happens to omit.
-        var merged = indexEntry ?? [:]
-        for (key, value) in detail {
-            merged[key] = value
-        }
-
-        guard let loaded = SurroundViewCaptureParser.capture(
-            from: merged,
-            vin: vehicle.vin,
-            shape: Self.surroundViewShape,
-            providerID: providerID,
-            apiName: apiName
-        ) else {
-            throw APIError.logError(
-                "Kia US 360 View capture \(providerID) carried no usable imagery",
-                apiName: apiName
+            // Send the id back with the TYPE the server used — `inquire`
+            // reports a JSON number, and the portal echoes `a.svmId`
+            // untouched. `providerID` is its string form, only ever a
+            // dictionary key; stringifying it on the wire risks a rejection.
+            let indexEntry = surroundViewIndex[providerID]
+            let detail = try await fetchSurroundViewDetail(
+                svmId: indexEntry?["svmId"] ?? providerID,
+                for: vehicle,
+                authToken: token
             )
-        }
 
-        surroundViewCache[providerID] = loaded
-        return loaded
+            // Overlay the detail onto its index entry so the parser reads one
+            // dictionary. `info` wins where the two overlap: it is the
+            // response that carries `imageSize`, and it repeats the location
+            // block anyway. Starting from the `inquire` entry rather than
+            // replacing it keeps anything the index reported and the detail
+            // happens to omit.
+            var merged = indexEntry ?? [:]
+            for (key, value) in detail {
+                merged[key] = value
+            }
+
+            guard let loaded = SurroundViewCaptureParser.capture(
+                from: merged,
+                vin: vehicle.vin,
+                shape: Self.surroundViewShape,
+                providerID: providerID,
+                apiName: apiName
+            ) else {
+                throw APIError.logError(
+                    "Kia US 360 View capture \(providerID) carried no usable imagery",
+                    apiName: apiName
+                )
+            }
+
+            surroundViewCache[providerID] = loaded
+            return loaded
+        }
     }
 
     // MARK: - Requests
@@ -540,58 +548,60 @@ extension KiaUSAAPIClient {
         for vehicle: Vehicle,
         authToken: AuthToken
     ) async throws -> [String: Any] {
-        let body: [String: Any] = [
-            "vehicleConfigReq": [
-                "airTempRange": "0",
-                "maintenance": "0",
-                "seatHeatCoolOption": "0",
-                "vehicle": "1",
-                "vehicleFeature": "1"
-            ],
-            "vehicleInfoReq": [
-                "drivingActivty": "0",
-                "dtc": "0",
-                "enrollment": "0",
-                "functionalCards": "0",
-                "location": "0",
-                "vehicleStatus": "1",
-                "weather": "0"
-            ],
-            "vinKey": [vehicle.vehicleKey ?? ""]
-        ]
+        try await withSessionRecovery(authToken: authToken) { token in
+            let body: [String: Any] = [
+                "vehicleConfigReq": [
+                    "airTempRange": "0",
+                    "maintenance": "0",
+                    "seatHeatCoolOption": "0",
+                    "vehicle": "1",
+                    "vehicleFeature": "1"
+                ],
+                "vehicleInfoReq": [
+                    "drivingActivty": "0",
+                    "dtc": "0",
+                    "enrollment": "0",
+                    "functionalCards": "0",
+                    "location": "0",
+                    "vehicleStatus": "1",
+                    "weather": "0"
+                ],
+                "vinKey": [vehicle.vehicleKey ?? ""]
+            ]
 
-        let (data, json, _) = try await performJSONRequest(
-            url: "\(apiURL)cmm/gvi",
-            method: .POST,
-            headers: authorizedHeaders(authToken: authToken, vehicleKey: vehicle.vehicleKey),
-            body: body,
-            requestType: .fetchVehicleStatus,
-            vin: vehicle.vin
-        )
-
-        try checkForKiaErrors(data: data)
-
-        // Same nesting the status parser walks: the config hangs off the
-        // per-vehicle entry in `vehicleInfoList`, not off `payload`.
-        //
-        // Surface the server's own status block when the tree is absent:
-        // an unrecognised error code would otherwise reach the caller as
-        // an empty dictionary, which reads as "no features" rather than
-        // "the request was refused".
-        guard let payload = json["payload"] as? [String: Any],
-              let vehicleInfoList = payload["vehicleInfoList"] as? [[String: Any]],
-              let vehicleInfo = vehicleInfoList.first(where: { $0["vinKey"] as? String == vehicle.vehicleKey })
-              ?? vehicleInfoList.first,
-              let config = vehicleInfo["vehicleConfig"] as? [String: Any],
-              let features = config["vehicleFeature"] as? [String: Any] else {
-            let status = (json["status"] as? [String: Any]).map { "\($0)" } ?? "no status block"
-            throw APIError.logError(
-                "Kia gvi returned no vehicleConfig.vehicleFeature — \(status)",
-                apiName: apiName
+            let (data, json, _) = try await performJSONRequest(
+                url: "\(apiURL)cmm/gvi",
+                method: .POST,
+                headers: authorizedHeaders(authToken: token, vehicleKey: vehicle.vehicleKey),
+                body: body,
+                requestType: .fetchVehicleStatus,
+                vin: vehicle.vin
             )
-        }
 
-        return features
+            try checkForKiaErrors(data: data)
+
+            // Same nesting the status parser walks: the config hangs off the
+            // per-vehicle entry in `vehicleInfoList`, not off `payload`.
+            //
+            // Surface the server's own status block when the tree is absent:
+            // an unrecognised error code would otherwise reach the caller as
+            // an empty dictionary, which reads as "no features" rather than
+            // "the request was refused".
+            guard let payload = json["payload"] as? [String: Any],
+                  let vehicleInfoList = payload["vehicleInfoList"] as? [[String: Any]],
+                  let vehicleInfo = vehicleInfoList.first(where: { $0["vinKey"] as? String == vehicle.vehicleKey })
+                  ?? vehicleInfoList.first,
+                  let config = vehicleInfo["vehicleConfig"] as? [String: Any],
+                  let features = config["vehicleFeature"] as? [String: Any] else {
+                let status = (json["status"] as? [String: Any]).map { "\($0)" } ?? "no status block"
+                throw APIError.logError(
+                    "Kia gvi returned no vehicleConfig.vehicleFeature — \(status)",
+                    apiName: apiName
+                )
+            }
+
+            return features
+        }
     }
 
     /// Whether this vehicle advertises 360-view hardware.

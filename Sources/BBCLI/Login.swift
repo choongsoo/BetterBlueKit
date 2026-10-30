@@ -2,7 +2,7 @@
 //  Login.swift
 //  BBCLI
 //
-//  Authentication: establishing this account's device identity, logging
+//  Authentication:  establishing this account's device identity, logging
 //  in (reusing a saved session where one is still valid), and walking the
 //  MFA challenge when the backend asks for one.
 //
@@ -118,6 +118,10 @@ func performLogin(state: CLIState) async throws {
                 // The backend rotates this periodically; persisting the new
                 // value is what keeps the next launch from re-challenging.
                 state.updateSession { $0.rememberMeToken = rotated }
+            },
+            onAuthTokenRefreshed: { refreshed in
+                state.authToken = refreshed
+                state.updateSession { $0.authToken = refreshed }
             }
         )
     }
@@ -202,7 +206,7 @@ func handleMFA(client: any APIClientProtocol, error: APIError, state: CLIState) 
     }
 
     if code != rawCode {
-        print("Note: Cleaned input from '\\(rawCode)' to '\\(code)'")
+        print("Note: Cleaned input from '\(rawCode)' to '\(code)'")
     }
 
     print("Verifying MFA code...")
